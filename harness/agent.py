@@ -274,6 +274,37 @@ def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:
 #: docstring for the measured reason).
 ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
 
+#: First line of the addendum — how `ReActAgent` recognises a prompt that
+#: already carries it.
+_ADDENDUM_HEAD = REAL_MODEL_PROMPT_ADDENDUM.strip().splitlines()[0]
+
+#: Sent (once) when a model writes FINAL before calling any tool. No
+#: FINALIZE sentinel: this asks for MORE work, not for the answer.
+SEARCH_FIRST_NUDGE = (
+    "Bạn chưa gọi công cụ nào nên kết luận này chưa có căn cứ. Theo quy tắc, "
+    "hãy gọi search (rồi fetch_doc tài liệu phù hợp) trước khi viết FINAL. "
+    "Lượt tiếp theo hãy trả lời bằng THOUGHT và ACTION."
+)
+
+
+def _is_mock_model(model) -> bool:
+    """Is the innermost model the offline `MockModel`?
+
+    The frozen runner wraps the client in `ProvenanceModel(inner=...)`;
+    walk `.inner` links (bounded) to find what is really answering.
+    """
+    from arena.model import MockModel
+
+    current = model
+    for _ in range(8):
+        if isinstance(current, MockModel):
+            return True
+        current = getattr(current, "inner", None)
+        if current is None:
+            return False
+    return False
+
+
 #: `output_text` is clamped to this before it is stamped on `model_call`.
 #: `Trace.emit` truncates any record over 90,000 characters, and a
 #: truncated FINAL stops being decodable JSON — which costs all 55
@@ -480,7 +511,21 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
+        # The frozen runner hands over the bare `ARENA_SYSTEM_PROMPT` unless
+        # the instructor turns its own addendum on. On a REAL endpoint that
+        # prompt measurably produces turn-1 abstentions with zero tool
+        # calls (see the module docstring), so `REAL_MODEL_PROMPT_ADDENDUM`
+        # is sent whenever the model is not the offline `MockModel` — the
+        # mock path stays byte-identical to the practice ladder.
+        # It travels as a SECOND system message so the first one stays
+        # exactly the prompt the runner handed over.
         self.system_prompt = system_prompt
+        self.prompt_addendum = (
+            REAL_MODEL_PROMPT_ADDENDUM.strip()
+            if not _is_mock_model(model)
+            and not (isinstance(system_prompt, str) and _ADDENDUM_HEAD in system_prompt)
+            else ""
+        )
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
         # `run()`; kept on the agent rather than in `ctx.state`, which
@@ -503,13 +548,14 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._search_nudged = False
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
-        ctx.messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": ctx.question},
-        ]
+        ctx.messages = [{"role": "system", "content": self.system_prompt}]
+        if self.prompt_addendum:
+            ctx.messages.append({"role": "system", "content": self.prompt_addendum})
+        ctx.messages.append({"role": "user", "content": ctx.question})
         self.middleware.before_agent(ctx)
 
         report: dict = {}
@@ -532,6 +578,15 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
+                if self._must_search_first(ctx):
+                    # A FINAL before a single tool call is a guess (most
+                    # often a turn-1 "không đủ căn cứ"). Refuse it ONCE,
+                    # keep it as a fallback, and ask for a search.
+                    self._search_nudged = True
+                    if isinstance(parsed.final, dict):
+                        self._refused_final = parsed.final
+                    ctx.messages.append({"role": "user", "content": SEARCH_FIRST_NUDGE})
+                    continue
                 report = parsed.final if isinstance(parsed.final, dict) else {}
                 ctx.stop_reason = "final"
                 break
@@ -558,6 +613,16 @@ class ReActAgent:
         # runner stamps its own `agent_end` with the timing it measured.
         self.trace.emit("agent_end", stop_reason=ctx.stop_reason, steps=ctx.step + 1)
         return report
+
+    def _must_search_first(self, ctx) -> bool:
+        if self._search_nudged:
+            return False
+        calls = getattr(self.tools, "calls", None)
+        if not isinstance(calls, int) or calls > 0 or ctx.observations:
+            return False
+        # Never fight the budget layer: if it already told the model to
+        # finish, the FINAL stands.
+        return ctx.step + 2 < self.max_steps
 
     # -- reading the model ---------------------------------------------
 

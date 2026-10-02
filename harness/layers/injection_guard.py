@@ -69,10 +69,73 @@ class InjectionGuard(Middleware):
         #     cắt từ BLOCK_START tới hết chuỗi.
         #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
         #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        #
+        #  Thêm: với kết quả `search` (JSON), thiếu BLOCK_END thì chỉ cắt tới
+        #  hết chuỗi snippet (dấu nháy kép kế tiếp) để không xoá các kết quả
+        #  khác; chuỗi canary lọt ngoài khối (snippet cắt giữa khối) cũng bị
+        #  thay bằng PLACEHOLDER.
+        from arena.corpus import INJECTION_CANARY
+        from arena.tools import ToolResult
+
+        content = getattr(result, "content", None)
+        if not isinstance(content, str) or (
+            BLOCK_START not in content and INJECTION_CANARY not in content
+        ):
+            return result
+        while BLOCK_START in content:
+            start = content.index(BLOCK_START)
+            end = content.find(BLOCK_END, start)
+            if end != -1:
+                stop = end + len(BLOCK_END)
+            elif name == "search" and content.find('"', start) != -1:
+                stop = content.find('"', start)
+            else:
+                stop = len(content)
+            content = content[:start] + PLACEHOLDER + content[stop:]
+        content = content.replace(INJECTION_CANARY, PLACEHOLDER)
+        ctx.state["injection_blocks"] = ctx.state.get("injection_blocks", 0) + 1
+        return ToolResult(ok=result.ok, content=content, error=result.error)
 
     def after_agent(self, ctx, report):
         # TODO (§10): 2-4 dòng.
         #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
         #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        #
+        #  Scorer soát canary trên TOÀN BỘ report (json.dumps), không chỉ
+        #  answer. Vì vậy: gỡ canary khỏi mọi chuỗi KHÔNG phải claim text;
+        #  claim nào mang canary thì XOÁ cả claim (xoá hợp lệ, sửa chữ thì
+        #  không).
+        from arena.corpus import INJECTION_CANARY
+
+        if not isinstance(report, dict):
+            return report
+
+        def scrub(value):
+            if isinstance(value, str):
+                return value.replace(INJECTION_CANARY, "").strip() if INJECTION_CANARY in value else value
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            if isinstance(value, dict):
+                return {key: scrub(item) for key, item in value.items()}
+            return value
+
+        for key in list(report.keys()):
+            value = report[key]
+            if key == "claims" and isinstance(value, list):
+                kept = [
+                    claim
+                    for claim in value
+                    if not (isinstance(claim, dict) and INJECTION_CANARY in str(claim.get("text", "")))
+                ]
+                kept = [
+                    {k: (v if k == "text" else scrub(v)) for k, v in claim.items()}
+                    if isinstance(claim, dict)
+                    else claim
+                    for claim in kept
+                ]
+                if value and not kept:
+                    report["abstain"] = True
+                report[key] = kept
+            else:
+                report[key] = scrub(value)
+        return report

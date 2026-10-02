@@ -65,8 +65,11 @@ from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
 
 from harness.middleware import Middleware
 
-#: Tổng số lần thử, tính cả lần đầu.
-DEFAULT_MAX_ATTEMPTS = 3
+#: Tổng số lần thử, tính cả lần đầu. Đo trên 12 seed x 9 brief (flaky):
+#: 3 lần -> 79.76, 4 lần -> 81.06, 5-6 lần không hơn. Lần thử thứ tư cứu
+#: được tài liệu xếp hạng cao nhất trên các seed xui (truncate, truncate,
+#: timeout liên tiếp); ngân sách vẫn do `reserve` chặn.
+DEFAULT_MAX_ATTEMPTS = 4
 
 #: Số lượt để dành cho `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
@@ -98,4 +101,33 @@ class Retry(Middleware):
         #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
         #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
         #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        #
+        #  Thêm: KHÔNG thử lại lỗi tất định ("doc not found", "invalid
+        #  expression", tool lạ) — gọi lại vẫn hỏng y hệt, chỉ tốn ngân sách.
+        attempts = 1
+        while attempts < self.max_attempts and self._worth_retrying(result):
+            limit = ctx.max_tool_calls
+            if limit is not None and ctx.tools.calls >= limit - self.reserve:
+                break
+            result = call(name, args)
+            attempts += 1
+        ctx.state["retry_attempts"] = ctx.state.get("retry_attempts", 0) + attempts - 1
+        return result
+
+    @staticmethod
+    def _worth_retrying(result) -> bool:
+        content = getattr(result, "content", "")
+        content = content if isinstance(content, str) else ""
+        error = getattr(result, "error", "")
+        error = error if isinstance(error, str) else ""
+        broken = (not getattr(result, "ok", False)) or is_degraded(content)
+        if not broken:
+            return False
+        deterministic = (
+            "doc not found:" in error
+            or "invalid expression:" in error
+            or "doc not found:" in content
+            or "invalid expression:" in content
+            or "unknown tool" in error.lower()
+        )
+        return not deterministic

@@ -72,6 +72,17 @@ from harness.middleware import Middleware
 #: Dành lại cho lượt `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
 
+#: Số lượt model tối đa trước khi nhắc chốt, kể cả khi ngân sách công cụ
+#: chưa cạn. MockModel cần tới 31 lượt chỉ khi MỌI lượt công cụ đều hỏng;
+#: với `retry` bên dưới, một lượt chạy bình thường dùng chưa tới 12.
+DEFAULT_MAX_TURNS = 24
+
+#: Trả lời cho một lượt gọi lặp lại y hệt lượt đã có kết quả sạch.
+REPEAT_NOTE = (
+    "(Lượt gọi này trùng hệt một lượt trước đó; kết quả đầy đủ đã có ở phía "
+    "trên trong hội thoại. Hãy dùng lại kết quả đó, đừng gọi lại.)"
+)
+
 NUDGE = (
     "Ngân sách công cụ đã hết. Hãy trả lời ngay bằng bằng chứng đang có, "
     f"không gọi thêm công cụ nào nữa. {FINALIZE_SENTINEL}"
@@ -83,21 +94,29 @@ class BudgetPolicy(Middleware):
 
     name = "budget_policy"
 
-    def __init__(self, reserve: int = DEFAULT_RESERVE) -> None:
+    def __init__(self, reserve: int = DEFAULT_RESERVE, max_turns: int = DEFAULT_MAX_TURNS) -> None:
         self.reserve = max(0, int(reserve))
+        self.max_turns = max(1, int(max_turns))
 
     def _spent(self, ctx) -> bool:
         # TODO (§3): 2 dòng — "ngân sách đã cạn đến phần dự trữ chưa?"
         #  limit = ctx.max_tool_calls; None nghĩa là brief không đặt ngân
         #  sách -> chưa bao giờ cạn. Ngược lại:
         #  ctx.tools.calls >= limit - self.reserve
-        return False
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
 
     def before_model(self, ctx, messages):
         # TODO (§3): khoảng 4-6 dòng.
         #  1. Nếu chưa cạn (`not self._spent(ctx)`) -> trả messages nguyên vẹn.
         #  2. Ngược lại: trả về messages + [{"role": "user", "content": NUDGE}]
-        return messages  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        #
+        #  Thêm: một mô hình thật có thể nói mãi mà không chốt (nhất là khi
+        #  brief không đặt ngân sách công cụ). Quá `max_turns` lượt model
+        #  cũng nhắc chốt, để token không phình vô hạn.
+        if not self._spent(ctx) and ctx.step < self.max_turns:
+            return messages
+        return messages + [{"role": "user", "content": NUDGE}]
 
     def wrap_tool_call(self, ctx, call, name, args):
         # TODO (§3): khoảng 4-6 dòng.
@@ -106,4 +125,28 @@ class BudgetPolicy(Middleware):
         #     ToolResult(ok=False, content="", error="<lý do>").
         #     Không calling through chính là cách một lớp middleware
         #     "chặn" một hành động — xem harness/middleware.py.
-        return call(name, args)  # <- mặc định KHÔNG LÀM GÌ
+        #
+        #  Thêm: lượt gọi LẶP Y HỆT một lượt đã trả kết quả sạch (search cùng
+        #  truy vấn, fetch lại tài liệu đã đọc) được trả lời từ bộ nhớ đệm,
+        #  KHÔNG tốn lượt công cụ và không lặp lại cả tài liệu vào ngữ cảnh.
+        import json
+
+        from arena.model import is_degraded
+
+        try_key = json.dumps([name, args], sort_keys=True, ensure_ascii=False, default=str)
+        cache = ctx.state.setdefault("budget_cache", {})
+        if try_key in cache:
+            ctx.state["budget_cache_hits"] = ctx.state.get("budget_cache_hits", 0) + 1
+            return ToolResult(ok=True, content=cache[try_key], error=None)
+        if self._spent(ctx):
+            ctx.state["budget_blocked"] = ctx.state.get("budget_blocked", 0) + 1
+            return ToolResult(
+                ok=False,
+                content="",
+                error="Ngân sách công cụ đã hết: hãy chốt FINAL bằng bằng chứng đang có.",
+            )
+        result = call(name, args)
+        content = getattr(result, "content", None)
+        if getattr(result, "ok", False) and isinstance(content, str) and content and not is_degraded(content):
+            cache[try_key] = REPEAT_NOTE
+        return result
